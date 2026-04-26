@@ -86,11 +86,18 @@ async def search(req: SearchRequest):
             out body 20;
             """
             r = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": overpass_query}
-            )
-            data = r.json()
-            osm_places = data.get("elements", [])
+    "https://overpass-api.de/api/interpreter",
+    data={"data": overpass_query},
+    timeout=15
+)
+try:
+    data = r.json()
+except Exception as e:
+    # Overpass returned invalid/empty response
+    print(f"Overpass JSON error: {e}")
+    print(f"Response text: {r.text[:200]}")
+    data = {"elements": []}
+osm_places = data.get("elements", [])
 
             for p in osm_places[:15]:
                 tags = p.get("tags", {})
@@ -120,17 +127,16 @@ async def search(req: SearchRequest):
     if not places:
         # Fallback - search by amenity type only if name search returns nothing
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                overpass_query = f"""
-                [out:json][timeout:10];
-                node["amenity"~"restaurant|cafe|fast_food"](around:{req.radius},{req.latitude},{req.longitude});
-                out body 15;
-                """
-                r = await client.post(
-                    "https://overpass-api.de/api/interpreter",
-                    data={"data": overpass_query}
-                )
-                data = r.json()
+           r = await client.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": overpass_query}
+        )
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"Fallback Overpass JSON error: {e}")
+            print(f"Response text: {r.text[:200]}")
+            data = {"elements": []}
                 for p in data.get("elements", [])[:15]:
                     tags = p.get("tags", {})
                     name = tags.get("name")
