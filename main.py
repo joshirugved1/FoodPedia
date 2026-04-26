@@ -71,11 +71,10 @@ async def search(req: SearchRequest):
 
     search_query = parsed.get("search_query", req.prompt)
 
-    # STEP 2 - Search OpenStreetMap via Overpass API (completely free)
+    # STEP 2 - Search OpenStreetMap via Overpass API
     places = []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            # Search for food places using Overpass API
             overpass_query = f"""
             [out:json][timeout:10];
             (
@@ -86,62 +85,21 @@ async def search(req: SearchRequest):
             out body 20;
             """
             r = await client.post(
-    "https://overpass-api.de/api/interpreter",
-    data={"data": overpass_query},
-    timeout=15
-)
-try:
-    data = r.json()
-except Exception as e:
-    # Overpass returned invalid/empty response
-    print(f"Overpass JSON error: {e}")
-    print(f"Response text: {r.text[:200]}")
-    data = {"elements": []}
-osm_places = data.get("elements", [])
+                "https://overpass-api.de/api/interpreter",
+                data={"data": overpass_query}
+            )
+            
+            if r.status_code == 200 and r.text:
+                data = r.json()
+                osm_places = data.get("elements", [])
 
-            for p in osm_places[:15]:
-                tags = p.get("tags", {})
-                name = tags.get("name")
-                if not name:
-                    continue
-                lat = p.get("lat", req.latitude)
-                lon = p.get("lon", req.longitude)
-                places.append({
-                    "place_id": str(p.get("id")),
-                    "name": name,
-                    "rating": None,
-                    "price_level": None,
-                    "address": tags.get("addr:street", tags.get("addr:full", "Nearby")),
-                    "open_now": None,
-                    "photo_url": None,
-                    "location": {"lat": lat, "lng": lon},
-                    "types": [tags.get("amenity", "restaurant")],
-                    "review_count": 0,
-                    "cuisine": tags.get("cuisine", ""),
-                    "phone": tags.get("phone", ""),
-                    "website": tags.get("website", ""),
-                })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Map search failed: {str(e)}")
-
-    if not places:
-        # Fallback - search by amenity type only if name search returns nothing
-        try:
-           r = await client.post(
-            "https://overpass-api.de/api/interpreter",
-            data={"data": overpass_query}
-        )
-        try:
-            data = r.json()
-        except Exception as e:
-            print(f"Fallback Overpass JSON error: {e}")
-            print(f"Response text: {r.text[:200]}")
-            data = {"elements": []}
-                for p in data.get("elements", [])[:15]:
+                for p in osm_places[:15]:
                     tags = p.get("tags", {})
                     name = tags.get("name")
                     if not name:
                         continue
+                    lat = p.get("lat", req.latitude)
+                    lon = p.get("lon", req.longitude)
                     places.append({
                         "place_id": str(p.get("id")),
                         "name": name,
@@ -150,13 +108,51 @@ osm_places = data.get("elements", [])
                         "address": tags.get("addr:street", tags.get("addr:full", "Nearby")),
                         "open_now": None,
                         "photo_url": None,
-                        "location": {"lat": p.get("lat"), "lng": p.get("lon")},
+                        "location": {"lat": lat, "lng": lon},
                         "types": [tags.get("amenity", "restaurant")],
                         "review_count": 0,
                         "cuisine": tags.get("cuisine", ""),
+                        "phone": tags.get("phone", ""),
+                        "website": tags.get("website", ""),
                     })
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"Map search error: {e}")
+
+    if not places:
+        # Fallback - broader search
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                overpass_query = f"""
+                [out:json][timeout:10];
+                node["amenity"~"restaurant|cafe|fast_food"](around:{req.radius},{req.latitude},{req.longitude});
+                out body 15;
+                """
+                r = await client.post(
+                    "https://overpass-api.de/api/interpreter",
+                    data={"data": overpass_query}
+                )
+                if r.status_code == 200 and r.text:
+                    data = r.json()
+                    for p in data.get("elements", [])[:15]:
+                        tags = p.get("tags", {})
+                        name = tags.get("name")
+                        if not name:
+                            continue
+                        places.append({
+                            "place_id": str(p.get("id")),
+                            "name": name,
+                            "rating": None,
+                            "price_level": None,
+                            "address": tags.get("addr:street", tags.get("addr:full", "Nearby")),
+                            "open_now": None,
+                            "photo_url": None,
+                            "location": {"lat": p.get("lat"), "lng": p.get("lon")},
+                            "types": [tags.get("amenity", "restaurant")],
+                            "review_count": 0,
+                            "cuisine": tags.get("cuisine", ""),
+                        })
+        except Exception as e:
+            print(f"Fallback search error: {e}")
 
     if not places:
         return {"places": [], "parsed": parsed, "total": 0}
@@ -183,7 +179,6 @@ osm_places = data.get("elements", [])
             ]
         )
         content = rank_res.choices[0].message.content.strip()
-        # Extract JSON array from response
         start = content.find("[")
         end = content.rfind("]") + 1
         if start >= 0 and end > start:
@@ -191,10 +186,11 @@ osm_places = data.get("elements", [])
             rank_map = {r["place_id"]: r for r in rankings}
         else:
             rank_map = {}
-    except Exception:
+    except Exception as e:
+        print(f"Ranking error: {e}")
         rank_map = {}
 
-    # Merge rankings with place data
+    # Merge rankings
     for p in places:
         pid = p["place_id"]
         rank = rank_map.get(pid, {"match_score": 60, "match_reason": "Nearby food option"})
@@ -207,7 +203,6 @@ osm_places = data.get("elements", [])
 
 @app.get("/places/{place_id}")
 async def place_detail(place_id: str):
-    # Get details from OpenStreetMap
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -272,21 +267,23 @@ async def trending(lat: float = 19.0760, lng: float = 72.8777):
                 "https://overpass-api.de/api/interpreter",
                 data={"data": overpass_query}
             )
-            data = r.json()
-            places = []
-            for p in data.get("elements", [])[:8]:
-                tags = p.get("tags", {})
-                name = tags.get("name")
-                if not name:
-                    continue
-                places.append({
-                    "place_id": str(p.get("id")),
-                    "name": name,
-                    "rating": None,
-                    "address": tags.get("addr:street", "Nearby"),
-                    "photo_url": None,
-                    "price_level": None,
-                })
-            return {"trending": places}
+            if r.status_code == 200 and r.text:
+                data = r.json()
+                places = []
+                for p in data.get("elements", [])[:8]:
+                    tags = p.get("tags", {})
+                    name = tags.get("name")
+                    if not name:
+                        continue
+                    places.append({
+                        "place_id": str(p.get("id")),
+                        "name": name,
+                        "rating": None,
+                        "address": tags.get("addr:street", "Nearby"),
+                        "photo_url": None,
+                        "price_level": None,
+                    })
+                return {"trending": places}
     except Exception:
-        return {"trending": []}
+        pass
+    return {"trending": []}
